@@ -1,0 +1,12 @@
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: keyplay-metadata-api
+spec:
+  maxReplicas: ${MAX_REPLICAS_HPA}
+  minReplicas: 2
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: keyplay-metadata-api
+  targetCPUUtilizationPercentage: 60

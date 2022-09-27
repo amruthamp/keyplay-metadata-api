@@ -1,0 +1,16 @@
+kind: "Service"
+apiVersion: "v1"
+metadata:
+  name: "keyplay-metadata-api"
+  labels:
+    name: "keyplay-metadata-api"
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: "TCP"
+    # TODO must be changed after allocation of a port for the service
+    nodePort: 0
+  selector:
+    name: "keyplay-metadata-api"
+  type: "NodePort"

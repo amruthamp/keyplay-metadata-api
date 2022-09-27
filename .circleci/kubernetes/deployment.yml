@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    name: keyplay-metadata-api
+    tags.datadoghq.com/env: "${DEPLOY_ENV}"
+    tags.datadoghq.com/service: keyplay-metadata-api
+    tags.datadoghq.com/version: "${GITHASH}"
+  name: keyplay-metadata-api
+  namespace: default
+spec:
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      name: keyplay-metadata-api
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        name: keyplay-metadata-api
+        tags.datadoghq.com/env: "${DEPLOY_ENV}"
+        tags.datadoghq.com/service: keyplay-metadata-api
+        tags.datadoghq.com/version: "${GITHASH}"
+    spec:
+      volumes:
+       - name: "gcloud-secrets"
+         secret:
+           secretName: account
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              #prefer non-preemptible vms over preemptible vms, vms without this label, but will run on either
+              matchExpressions:
+              #labelled automatically by GKE when creating a preemptible node pool
+              - key: cloud.google.com/gke-preemptible
+                operator: DoesNotExist
+      containers:
+      - name: keyplay-metadata-api
+        imagePullPolicy: Always
+        readinessProbe:
+          httpGet:
+            path: /keyplay-metadata-api/healthcheck
+            port: 8080
+          initialDelaySeconds: 1
+          timeoutSeconds: 2
+          periodSeconds: 60
+        livenessProbe:
+          httpGet:
+            path: /keyplay-metadata-api/healthcheck
+            port: 8080
+          initialDelaySeconds: 1
+          timeoutSeconds: 3
+          periodSeconds: 60
+        resources:
+          limits:
+            cpu: 2
+            memory: 4Gi
+          requests:
+            cpu: ${CPU}
+            memory: ${RAM}
+        volumeMounts:
+         - name: "gcloud-secrets"
+           mountPath: "/etc/secrets/gcloud"
+           readOnly: true
+        env:
+          -
+            name: "GITHASH"
+            value: "${GITHASH}"
+          -
+            name: "BUILD_SOURCE"
+            value: "${BUILD_SOURCE}"
+          -
+            name: "BUILD_NUM"
+            value: "${CIRCLE_BUILD_NUM}"
+          -
+            name: "DEPLOY_ENV"
+            value: "${DEPLOY_ENV}"
+          -
+            name: "ENABLE_DATADOG"
+            value: "true"
+          -
+            name: "LOG_LEVEL"
+            value: "${LOG_LEVEL}"
+          -
+            name: "DEPLOY_TIMESTAMP"
+            value: "${DEPLOY_TIMESTAMP}"
+          -
+            name: "GCLOUD_PROJECT_ID"
+            value: "${GCLOUD_PROJECT_ID}"
+          -
+            name: "CLUSTER_NAME"
+            value: "${CLUSTER_NAME}"
+          -
+            name: "SWAGGER_DIR"
+            value: "${SWAGGER_DIR}"
+          -
+            name: "SERVICE_ACCOUNT"
+            value: "${SERVICE_ACCOUNT}"
+          -
+            name: "LAUNCHDARKLY_SDK_KEY"
+            value: "${LAUNCHDARKLY_SDK_KEY}"
+          -
+            name: "LAUNCHDARKLY_OFFLINE"
+            value: "${LAUNCHDARKLY_OFFLINE}"
+          -
+            name: "GOOGLE_APPLICATION_CREDENTIALS"
+            value: "${BT_CONNECTION_CREDENTIALS}"
+          -
+            name: "GOMAXPROCS"
+            value: "2"
+          -
+            name: "BT_PROJECT_ID"
+            value: "${BT_PROJECT_ID}"
+          -
+            name: "BT_INSTANCE_ID"
+            value: "${BT_INSTANCE_ID}"
+        image: "${NEW_IMAGE_NAME}"
+        command: ["/go/bin/keyplay-metadata-api"]
+      dnsPolicy: ClusterFirst
+      priorityClassName: high-priority
+      restartPolicy: Always
+      securityContext: {}
+      tolerations:
+      - effect: NoSchedule
+        key: cloud.google.com/gke-preemptible
+        operator: Exists
+      terminationGracePeriodSeconds: 30

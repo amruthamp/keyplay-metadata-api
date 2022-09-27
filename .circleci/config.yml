@@ -1,0 +1,356 @@
+version: 2
+jobs:
+  install_dependencies:
+    docker:
+      - image: circleci/golang:1.14
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    environment:
+      GO111MODULE: "on"
+      GOPRIVATE: github.com/fubotv
+    steps:
+      - checkout
+      - run:
+          go mod vendor
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+  test:
+    docker:
+      - image: circleci/golang:1.14
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    environment:
+      TEST_RESULTS: /tmp/test-results
+      CLOUDSDK_CORE_DISABLE_PROMPTS: 1
+      CLOUDSDK_PYTHON_SITEPACKAGES: 1
+      LOG_LEVEL: verbose
+      IMAGE_PULL_POLICY: Always
+      MAX_UNIT_TEST_CONCURRENCY: 32
+      ENABLE_CACHE: true
+      GOFLAGS: -mod=vendor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Create a directory for test reports
+          command:
+            mkdir test
+      - run:
+          name: Run tests and generate reports
+          command: go test -covermode=count -coverprofile=test/coverage.txt ./app/...
+      - run:
+          name: install coveralls app
+          command: cd .. && go get github.com/mattn/goveralls && cd -
+#      TODO uncomment this when ready to start post test results
+#      - run:
+#          name: post results
+#          command: |
+#            cat test/coverage.txt | grep -v '_mock.go' > test/temp && mv test/temp test/coverage.txt
+#            /go/bin/goveralls -coverprofile=test/coverage.txt -service=circle-ci -repotoken=$COVERALLS_REPO_TOKEN
+
+  build:
+    docker:
+      - image: circleci/golang:1.14
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    environment:
+      GOFLAGS: -mod=vendor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build
+          command: |
+            go build -v -o ./build/keyplay-metadata-api ./app
+            chmod +x ./build/keyplay-metadata-api
+          environment:
+            CGO_ENABLED: 0
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  # uses source-code + third-party dependencies installed in build step
+  generate_documentation:
+    docker:
+      - image: circleci/golang:1.14
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    environment:
+      GO111MODULE: "on"
+      GOPRIVATE: github.com/fubotv
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install go-swagger
+          command: cd && GO111MODULE=on go get github.com/go-swagger/go-swagger/cmd/swagger@v0.26.1
+      - run:
+          name: Generate swagger spec
+          command: cd /go/src/github.com/fubotv/keyplay-metadata-api/app && swagger generate spec -o ../swagger.json --scan-models && cd ..
+      - run:
+          name: Validate swagger spec
+          command: swagger validate swagger.json
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  # push swagger spec into apiary
+  upload_documentation:
+    docker:
+      - image: circleci/ruby:3.0-bullseye-node-browsers-legacy
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          keys:
+            - apiary-gem-cache
+      - run:
+          name: Install Apiary CLI
+          command: GEM_HOME="${HOME}/ruby" gem install apiaryio
+      - run:
+          name: Push swagger spec to Apiary
+          command: GEM_HOME="${HOME}/ruby" ~/ruby/bin/apiary publish --path=./swagger.json --json --api-name=spservicestemplate
+      - save_cache:
+          key: apiary-gem-cache
+          paths:
+            - /home/circleci/.gem
+
+  deploy-dev:
+    docker:
+      - image: gcr.io/fubotv-dev/circleci-docker-gcloud-kubectl:latest
+        auth:
+          username: _json_key
+          password: $DEV_GCLOUD_KEY_JSON
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    steps:
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Install curl, jq, gettext
+          command: |
+            apk update && apk add curl && apk add jq
+            apk add --update gettext
+      - run:
+          name: Install helm client, init client
+          command: |
+            curl https://raw.githubusercontent.com/kubernetes/helm/master/scripts/get > get_helm.sh
+            chmod 700 get_helm.sh
+            ./get_helm.sh -v v2.17.0
+      - run:
+          name: Build image
+          command: docker build -t gcr.io/$DEV_GCLOUD_PROJECT_ID/keyplay-metadata-api:$CIRCLE_BUILD_NUM .
+      - run:
+          name: Deploy Memcached cluster
+          command: >
+            DEPLOY_ENV=development
+            PROJECT_KEY=dev-service.key
+            GCLOUD_KEY=$DEV_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$DEV_GCLOUD_PROJECT_ID
+            SERVICE_ACCOUNT=$DEV_SERVICE_ACCOUNT
+            MEMCACHED_CPU=50m
+            MEMCACHED_RAM=64Mi
+            MEMCACHED_REPLICAS=2
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            CACHE_TTL_MIN=240
+            .circleci/scripts/deploy_memcached.sh
+
+      - run:
+          name: Deploy
+          command: >
+            PROJECT_KEY=dev-service.key
+            GCLOUD_KEY=$DEV_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$DEV_GCLOUD_PROJECT_ID
+            SERVICE_ACCOUNT=$DEV_SERVICE_ACCOUNT
+            BUILD_SOURCE=$CIRCLE_BRANCH
+            CPU=2
+            RAM=4Gi
+            REPLICAS=2
+            MAX_REPLICAS_HPA=2
+            DEPLOY_ENV=development
+            SWAGGER_DIR=/swaggerui
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            ENABLE_CACHE=true
+            LAUNCHDARKLY_SDK_KEY=$DEV_LAUNCHDARKLY_SDK_KEY
+            LAUNCHDARKLY_OFFLINE=$DEV_LAUNCHDARKLY_OFFLINE
+            LOG_LEVEL=$DEV_LOG_LEVEL
+            .circleci/scripts/deploy.sh
+
+  deploy-qa:
+    docker:
+      - image: gcr.io/fubotv-dev/circleci-docker-gcloud-kubectl:latest
+        auth:
+          username: _json_key
+          password: $DEV_GCLOUD_KEY_JSON
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    steps:
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Install curl, jq, gettext
+          command: |
+            apk update && apk add curl && apk add jq
+            apk add --update gettext
+      - run:
+          name: Install helm client, init client
+          command: |
+            curl https://raw.githubusercontent.com/kubernetes/helm/master/scripts/get > get_helm.sh
+            chmod 700 get_helm.sh
+            ./get_helm.sh -v v2.17.0
+      - run:
+          name: Build image
+          command: docker build -t gcr.io/$QA_GCLOUD_PROJECT_ID/keyplay-metadata-api:$CIRCLE_BUILD_NUM .
+      - run:
+          name: Deploy Memcached cluster
+          command: >
+            DEPLOY_ENV=qa
+            PROJECT_KEY=qa-service.key
+            GCLOUD_KEY=$QA_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$QA_GCLOUD_PROJECT_ID
+            SERVICE_ACCOUNT=$QA_SERVICE_ACCOUNT
+            MEMCACHED_CPU=250m
+            MEMCACHED_RAM=256Mi
+            MEMCACHED_REPLICAS=2
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            CACHE_TTL_MIN=240
+            LOG_LEVEL=$QA_LOG_LEVEL
+            .circleci/scripts/deploy_memcached.sh
+      - run:
+          name: Deploy
+          command: >
+            PROJECT_KEY=qa-service.key
+            SERVICE_ACCOUNT=$QA_SERVICE_ACCOUNT
+            GCLOUD_KEY=$QA_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$QA_GCLOUD_PROJECT_ID
+            BUILD_SOURCE=$CIRCLE_BRANCH
+            CPU=2
+            RAM=4Gi
+            REPLICAS=2
+            DEPLOY_ENV=qa
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            ENABLE_CACHE=true
+            MAX_REPLICAS_HPA=20
+            LAUNCHDARKLY_SDK_KEY=$QA_LAUNCHDARKLY_SDK_KEY
+            LAUNCHDARKLY_OFFLINE=$QA_LAUNCHDARKLY_OFFLINE
+            LOG_LEVEL=$PROD_LOG_LEVEL
+            .circleci/scripts/deploy.sh
+
+  deploy-prod:
+    docker:
+      - image: gcr.io/fubotv-dev/circleci-docker-gcloud-kubectl:latest
+        auth:
+          username: _json_key
+          password: $DEV_GCLOUD_KEY_JSON
+    working_directory: /go/src/github.com/fubotv/keyplay-metadata-api
+    steps:
+      - attach_workspace:
+          at: .
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Install curl, jq, gettext
+          command: |
+            apk update && apk add curl && apk add jq
+            apk add --update gettext
+      - run:
+          name: Install helm client, init client
+          command: |
+            curl https://raw.githubusercontent.com/kubernetes/helm/master/scripts/get > get_helm.sh
+            chmod 700 get_helm.sh
+            ./get_helm.sh -v v2.17.0
+      - run:
+          name: Deploy Memcached cluster
+          command: >
+            DEPLOY_ENV=production
+            PROJECT_KEY=prod-service.key
+            GCLOUD_KEY=$PROD_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$PROD_GCLOUD_PROJECT_ID
+            SERVICE_ACCOUNT=$PROD_SERVICE_ACCOUNT
+            MEMCACHED_CPU=250m
+            MEMCACHED_RAM=256Mi
+            MEMCACHED_REPLICAS=2
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            CACHE_TTL_MIN=240
+            .circleci/scripts/deploy_memcached.sh
+      - run:
+          name: Deploy
+          command: >
+            SOURCE_PROJECT_ID=$QA_GCLOUD_PROJECT_ID
+            SERVICE_ACCOUNT=$PROD_SERVICE_ACCOUNT
+            GCLOUD_KEY=$PROD_GCLOUD_KEY
+            GCLOUD_PROJECT_ID=$PROD_GCLOUD_PROJECT_ID
+            PROJECT_KEY=prod-service.key
+            BUILD_SOURCE=$CIRCLE_TAG
+            CPU=2
+            RAM=4Gi
+            REPLICAS=2
+            MAX_REPLICAS_HPA=20
+            DEPLOY_ENV=production
+            MEMCACHED_SERVICE_NAME=keyplay-metadata-api
+            ENABLE_CACHE=true
+            LAUNCHDARKLY_SDK_KEY=$PROD_LAUNCHDARKLY_SDK_KEY
+            LAUNCHDARKLY_OFFLINE=$PROD_LAUNCHDARKLY_OFFLINE
+            .circleci/scripts/promote.sh
+
+workflows:
+  version: 2
+  test-build-deploy:
+    jobs:
+      - install_dependencies
+      - test:
+          requires:
+            - install_dependencies
+          filters:
+            tags:
+              ignore: /^(release)-.*/
+
+      - build:
+          requires:
+            - install_dependencies
+          filters:
+            branches:
+              only:
+                - master
+                - /^(release)-.*/
+
+      # build docs on every branch, ensures documentation is valid
+      - generate_documentation:
+          requires:
+            - build
+
+      # only publish documentation from master branch
+      - upload_documentation:
+          requires:
+            - generate_documentation
+          filters:
+            branches:
+              only:
+                - master
+      # TODO uncomment this when ready to start deploying
+#      - deploy-dev:
+#          requires:
+#            - test
+#            - build
+#            - generate_documentation
+#          filters:
+#            branches:
+#              only:
+#                - master
+#              ignore: /^(release)-.*/
+#      - deploy-qa:
+#          requires:
+#            - test
+#            - build
+#            - generate_documentation
+#          filters:
+#            branches:
+#              only: /^(release)-.*/
+#      - deploy-prod:
+#          filters:
+#            tags:
+#              only: /^(release)-.*/
+#            branches:
+#              ignore: /.*/
